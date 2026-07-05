@@ -9,10 +9,11 @@
 //! - `free`: Free blocks when a request completes or is preempted.
 //! - `cache_blocks`: Cache newly-full blocks after computation.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use super::block_hash::BlockHash;
 use super::block_pool::BlockPool;
+use super::kv_cache_connector::{KvCacheConnector, NoopKvCacheConnector};
 
 /// Result of `get_computed_blocks`: cached block IDs and how many tokens they cover.
 #[derive(Debug)]
@@ -21,9 +22,26 @@ pub struct ComputedBlocks {
     /// For models with sliding window layers, early blocks may be `null_block_id`
     /// (placeholder for blocks outside the attention window).
     pub block_ids: Vec<usize>,
+    /// Block hashes available in an external connector tier but not currently
+    /// assigned to local physical blocks.
+    pub external_block_hashes: Vec<BlockHash>,
     /// Number of tokens covered by the cached blocks.
     /// Always a multiple of `block_size`.
     pub num_computed_tokens: usize,
+}
+
+impl ComputedBlocks {
+    fn local(block_ids: &[usize], block_size: usize) -> Self {
+        Self {
+            block_ids: block_ids.to_vec(),
+            external_block_hashes: Vec::new(),
+            num_computed_tokens: block_ids.len() * block_size,
+        }
+    }
+
+    fn num_computed_blocks(&self) -> usize {
+        self.block_ids.len() + self.external_block_hashes.len()
+    }
 }
 
 /// Per-request block allocation state.
@@ -48,6 +66,8 @@ pub struct KVCacheManager {
     /// Most models have a single group `[0]`. Models with multiple attention
     /// types (e.g., full + sliding window) use different group IDs per manager.
     kv_cache_group_ids: Vec<u32>,
+    /// Optional external KV tier connector. Defaults to no-op.
+    connector: Arc<dyn KvCacheConnector>,
     /// Per-request block tracking.
     req_to_blocks: HashMap<usize, RequestBlocks>,
 }
@@ -70,8 +90,19 @@ impl KVCacheManager {
             block_size,
             enable_caching,
             kv_cache_group_ids,
+            connector: Arc::new(NoopKvCacheConnector),
             req_to_blocks: HashMap::new(),
         }
+    }
+
+    /// Install an external KV cache connector. The default connector is no-op.
+    pub fn set_kv_cache_connector(&mut self, connector: Arc<dyn KvCacheConnector>) {
+        self.connector = connector;
+    }
+
+    pub fn with_kv_cache_connector(mut self, connector: Arc<dyn KvCacheConnector>) -> Self {
+        self.set_kv_cache_connector(connector);
+        self
     }
 
     /// Get a reference to the block pool.
@@ -129,6 +160,7 @@ impl KVCacheManager {
         if !self.enable_caching || block_hashes.is_empty() {
             return ComputedBlocks {
                 block_ids: Vec::new(),
+                external_block_hashes: Vec::new(),
                 num_computed_tokens: 0,
             };
         }
@@ -160,10 +192,25 @@ impl KVCacheManager {
             }
         }
 
-        let num_computed_tokens = cached_block_ids.len() * self.block_size;
+        let external_start = cached_block_ids.len();
+        let remaining = max_num_blocks.saturating_sub(external_start);
+        let external_block_hashes = if remaining == 0 {
+            Vec::new()
+        } else {
+            let candidates = &block_hashes[external_start..external_start + remaining];
+            let num_external = self
+                .connector
+                .lookup_blocks(candidates, &self.kv_cache_group_ids)
+                .min(candidates.len());
+            candidates[..num_external].to_vec()
+        };
+
+        let num_computed_tokens =
+            (cached_block_ids.len() + external_block_hashes.len()) * self.block_size;
 
         ComputedBlocks {
             block_ids: cached_block_ids,
+            external_block_hashes,
             num_computed_tokens,
         }
     }
@@ -186,6 +233,17 @@ impl KVCacheManager {
         num_tokens: usize,
         computed_blocks: &[usize],
     ) -> Option<Vec<usize>> {
+        let computed = ComputedBlocks::local(computed_blocks, self.block_size);
+        self.allocate_slots_for_computed(request_id, num_tokens, &computed)
+    }
+
+    /// Allocate blocks for a request using local and external computed blocks.
+    pub fn allocate_slots_for_computed(
+        &mut self,
+        request_id: usize,
+        num_tokens: usize,
+        computed_blocks: &ComputedBlocks,
+    ) -> Option<Vec<usize>> {
         let num_required_blocks = num_tokens.div_ceil(self.block_size);
 
         if let Some(req) = self.req_to_blocks.get(&request_id) {
@@ -197,7 +255,7 @@ impl KVCacheManager {
                 return Some(Vec::new());
             }
 
-            let new_block_ids = self.block_pool.get_new_blocks(num_new_blocks)?;
+            let new_block_ids = self.allocate_new_blocks(num_new_blocks)?;
             self.req_to_blocks
                 .get_mut(&request_id)
                 .unwrap()
@@ -207,7 +265,7 @@ impl KVCacheManager {
         }
 
         // New request, incorporate computed blocks + allocate new ones
-        let num_computed = computed_blocks.len();
+        let num_computed = computed_blocks.num_computed_blocks();
         let num_new_blocks = num_required_blocks.saturating_sub(num_computed);
 
         // Count evictable blocks among computed blocks (blocks with ref_cnt == 0
@@ -215,6 +273,7 @@ impl KVCacheManager {
         // free list, so we need to account for this in the capacity check).
         let num_evictable = if self.enable_caching {
             computed_blocks
+                .block_ids
                 .iter()
                 .filter(|&&id| self.block_pool.block_ref_cnt(id) == 0)
                 .count()
@@ -222,20 +281,32 @@ impl KVCacheManager {
             0
         };
 
-        let total_needed = num_new_blocks + num_evictable;
+        let num_external = computed_blocks.external_block_hashes.len();
+        let total_needed = num_new_blocks + num_evictable + num_external;
         if total_needed > self.block_pool.num_free_blocks() {
             return None;
         }
 
         // Touch the computed blocks (increment ref_cnt, remove from free list)
-        if !computed_blocks.is_empty() && self.enable_caching {
-            self.block_pool.touch(computed_blocks);
+        if !computed_blocks.block_ids.is_empty() && self.enable_caching {
+            self.block_pool.touch(&computed_blocks.block_ids);
         }
+
+        let external_block_ids = match self.allocate_external_blocks(computed_blocks) {
+            Some(ids) => ids,
+            None => {
+                if !computed_blocks.block_ids.is_empty() && self.enable_caching {
+                    let mut rollback_ids = computed_blocks.block_ids.clone();
+                    rollback_ids.reverse();
+                    self.block_pool.free_blocks(&rollback_ids);
+                }
+                return None;
+            }
+        };
 
         // Allocate new blocks
         let new_block_ids = if num_new_blocks > 0 {
-            self.block_pool
-                .get_new_blocks(num_new_blocks)
+            self.allocate_new_blocks(num_new_blocks)
                 .expect("Should have enough blocks after capacity check")
         } else {
             Vec::new()
@@ -243,7 +314,8 @@ impl KVCacheManager {
 
         // Build the full block list: computed + new
         let mut all_block_ids = Vec::with_capacity(num_required_blocks);
-        all_block_ids.extend_from_slice(computed_blocks);
+        all_block_ids.extend_from_slice(&computed_blocks.block_ids);
+        all_block_ids.extend_from_slice(&external_block_ids);
         all_block_ids.extend_from_slice(&new_block_ids);
 
         self.req_to_blocks.insert(
@@ -255,6 +327,48 @@ impl KVCacheManager {
         );
 
         Some(new_block_ids)
+    }
+
+    fn allocate_new_blocks(&mut self, num_blocks: usize) -> Option<Vec<usize>> {
+        let allocation = self.block_pool.get_new_blocks_with_evictions(num_blocks)?;
+        for evicted in &allocation.evicted_blocks {
+            self.connector
+                .offer_evicted_block(&evicted.block_hashes, evicted.block_id);
+        }
+        Some(allocation.block_ids)
+    }
+
+    fn allocate_external_blocks(&mut self, computed: &ComputedBlocks) -> Option<Vec<usize>> {
+        if computed.external_block_hashes.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let external_block_ids = self.allocate_new_blocks(computed.external_block_hashes.len())?;
+        for (&block_hash, &block_id) in computed
+            .external_block_hashes
+            .iter()
+            .zip(external_block_ids.iter())
+        {
+            if !self
+                .connector
+                .load_block(block_hash, &self.kv_cache_group_ids, block_id)
+            {
+                self.block_pool.free_blocks(&external_block_ids);
+                return None;
+            }
+        }
+
+        for (&block_hash, &block_id) in computed
+            .external_block_hashes
+            .iter()
+            .zip(external_block_ids.iter())
+        {
+            for &group_id in &self.kv_cache_group_ids {
+                self.block_pool
+                    .cache_full_blocks(&[block_id], &[block_hash], 0, 1, group_id);
+            }
+        }
+        Some(external_block_ids)
     }
 
     /// Free all blocks for a request.
@@ -340,6 +454,13 @@ impl KVCacheManager {
                 group_id,
             );
         }
+        self.connector.observe_store(
+            block_hashes,
+            &req.block_ids,
+            req.num_cached_blocks,
+            num_full_blocks,
+            &self.kv_cache_group_ids,
+        );
 
         req.num_cached_blocks = num_full_blocks;
     }
@@ -433,6 +554,85 @@ impl KVCacheManager {
 mod tests {
     use super::*;
     use crate::paged_attention::block_hash::compute_block_hashes;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingConnector {
+        external_hits: usize,
+        loaded: Mutex<Vec<(BlockHash, usize)>>,
+        stores: Mutex<Vec<usize>>,
+        evictions: Mutex<Vec<usize>>,
+    }
+
+    impl RecordingConnector {
+        fn with_external_hits(external_hits: usize) -> Self {
+            Self {
+                external_hits,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl KvCacheConnector for RecordingConnector {
+        fn lookup_blocks(&self, block_hashes: &[BlockHash], _group_ids: &[u32]) -> usize {
+            self.external_hits.min(block_hashes.len())
+        }
+
+        fn load_block(
+            &self,
+            block_hash: BlockHash,
+            _group_ids: &[u32],
+            target_block_id: usize,
+        ) -> bool {
+            self.loaded
+                .lock()
+                .unwrap()
+                .push((block_hash, target_block_id));
+            true
+        }
+
+        fn observe_store(
+            &self,
+            _block_hashes: &[BlockHash],
+            _block_ids: &[usize],
+            _num_cached_blocks: usize,
+            num_full_blocks: usize,
+            _group_ids: &[u32],
+        ) {
+            self.stores.lock().unwrap().push(num_full_blocks);
+        }
+
+        fn offer_evicted_block(
+            &self,
+            _block_hashes: &[super::super::block_hash::BlockHashWithGroupId],
+            block_id: usize,
+        ) {
+            self.evictions.lock().unwrap().push(block_id);
+        }
+    }
+
+    struct FailingConnector {
+        external_hits: usize,
+        successful_loads: usize,
+        loaded: Mutex<Vec<(BlockHash, usize)>>,
+    }
+
+    impl KvCacheConnector for FailingConnector {
+        fn lookup_blocks(&self, block_hashes: &[BlockHash], _group_ids: &[u32]) -> usize {
+            self.external_hits.min(block_hashes.len())
+        }
+
+        fn load_block(
+            &self,
+            block_hash: BlockHash,
+            _group_ids: &[u32],
+            target_block_id: usize,
+        ) -> bool {
+            let mut loaded = self.loaded.lock().unwrap();
+            loaded.push((block_hash, target_block_id));
+            loaded.len() <= self.successful_loads
+        }
+    }
 
     #[test]
     fn test_basic_allocation() {
@@ -502,6 +702,101 @@ mod tests {
         let new_blocks = mgr.allocate_slots(2, 12, &computed.block_ids).unwrap();
         assert_eq!(new_blocks.len(), 1); // only 1 new block needed
         assert_eq!(mgr.num_blocks_for_request(2), 3); // 2 cached + 1 new
+    }
+
+    #[test]
+    fn test_external_connector_hit_allocates_and_loads_blocks() {
+        let connector = Arc::new(RecordingConnector::with_external_hits(2));
+        let mut mgr =
+            KVCacheManager::new(16, 4, true, vec![0]).with_kv_cache_connector(connector.clone());
+        let tokens: Vec<u32> = (1..=12).collect();
+        let hashes = compute_block_hashes(&tokens, 4, &[], &[]);
+
+        let computed = mgr.get_computed_blocks(&hashes, 12);
+
+        assert_eq!(computed.block_ids.len(), 0);
+        assert_eq!(computed.external_block_hashes.len(), 2);
+        assert_eq!(computed.num_computed_tokens, 8);
+
+        let new_blocks = mgr
+            .allocate_slots_for_computed(7, 12, &computed)
+            .expect("external connector hit should allocate hydrated blocks");
+
+        assert_eq!(new_blocks.len(), 1);
+        assert_eq!(mgr.num_blocks_for_request(7), 3);
+        assert_eq!(mgr.num_cached_blocks(7), 2);
+        assert_eq!(connector.loaded.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_external_connector_load_failure_rolls_back_allocation() {
+        let connector = Arc::new(FailingConnector {
+            external_hits: 2,
+            successful_loads: 1,
+            loaded: Mutex::new(Vec::new()),
+        });
+        let mut mgr =
+            KVCacheManager::new(16, 4, true, vec![0]).with_kv_cache_connector(connector.clone());
+        let tokens: Vec<u32> = (1..=12).collect();
+        let hashes = compute_block_hashes(&tokens, 4, &[], &[]);
+
+        let computed = mgr.get_computed_blocks(&hashes, 12);
+        assert_eq!(computed.external_block_hashes.len(), 2);
+
+        assert!(mgr.allocate_slots_for_computed(7, 12, &computed).is_none());
+        assert!(!mgr.has_request(7));
+        assert_eq!(mgr.num_free_blocks(), 15);
+        assert!(mgr.block_pool().get_cached_block(hashes[0], &[0]).is_none());
+        assert_eq!(connector.loaded.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_external_connector_load_failure_rolls_back_local_hits() {
+        let connector = Arc::new(FailingConnector {
+            external_hits: 1,
+            successful_loads: 0,
+            loaded: Mutex::new(Vec::new()),
+        });
+        let mut mgr =
+            KVCacheManager::new(16, 4, true, vec![0]).with_kv_cache_connector(connector.clone());
+        let tokens: Vec<u32> = (1..=12).collect();
+        let hashes = compute_block_hashes(&tokens, 4, &[], &[]);
+
+        mgr.allocate_slots(1, 4, &[]).unwrap();
+        mgr.cache_blocks(1, &hashes, 4);
+        let local_block_id = mgr.get_block_ids(1).unwrap()[0];
+        mgr.free(1);
+
+        let computed = mgr.get_computed_blocks(&hashes, 12);
+        assert_eq!(computed.block_ids, vec![local_block_id]);
+        assert_eq!(computed.external_block_hashes.len(), 1);
+
+        assert!(mgr.allocate_slots_for_computed(7, 12, &computed).is_none());
+        assert!(!mgr.has_request(7));
+        assert_eq!(mgr.num_free_blocks(), 15);
+        assert_eq!(mgr.block_pool().block_ref_cnt(local_block_id), 0);
+        assert_eq!(
+            mgr.block_pool().get_cached_block(hashes[0], &[0]),
+            Some(vec![local_block_id])
+        );
+        assert_eq!(connector.loaded.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_connector_observes_store_and_eviction() {
+        let connector = Arc::new(RecordingConnector::default());
+        let mut mgr =
+            KVCacheManager::new(4, 4, true, vec![0]).with_kv_cache_connector(connector.clone());
+        let tokens: Vec<u32> = (1..=4).collect();
+        let hashes = compute_block_hashes(&tokens, 4, &[], &[]);
+
+        mgr.allocate_slots(1, 4, &[]).unwrap();
+        mgr.cache_blocks(1, &hashes, 4);
+        mgr.free(1);
+        mgr.allocate_slots(2, 12, &[]).unwrap();
+
+        assert_eq!(*connector.stores.lock().unwrap(), vec![1]);
+        assert_eq!(connector.evictions.lock().unwrap().len(), 1);
     }
 
     #[test]
