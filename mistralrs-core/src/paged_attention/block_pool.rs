@@ -188,6 +188,20 @@ enum CachedBlocks {
     Multiple(HashMap<usize, usize>), // block_id -> block_id
 }
 
+/// Cached hash metadata evicted when a free LRU block is reallocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedCacheBlock {
+    pub block_id: usize,
+    pub block_hashes: Vec<BlockHashWithGroupId>,
+}
+
+/// Result of allocating physical KV cache blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockAllocation {
+    pub block_ids: Vec<usize>,
+    pub evicted_blocks: Vec<EvictedCacheBlock>,
+}
+
 impl BlockHashToBlockMap {
     fn new() -> Self {
         Self {
@@ -420,11 +434,18 @@ impl BlockPool {
     ///
     /// Returns `None` if not enough free blocks are available.
     pub fn get_new_blocks(&mut self, num_blocks: usize) -> Option<Vec<usize>> {
+        self.get_new_blocks_with_evictions(num_blocks)
+            .map(|allocation| allocation.block_ids)
+    }
+
+    /// Allocate new blocks and return any cached hash metadata evicted by reuse.
+    pub fn get_new_blocks_with_evictions(&mut self, num_blocks: usize) -> Option<BlockAllocation> {
         if num_blocks > self.free_queue.num_free_blocks {
             return None;
         }
 
-        let mut result = Vec::with_capacity(num_blocks);
+        let mut block_ids = Vec::with_capacity(num_blocks);
+        let mut evicted_blocks = Vec::new();
         for _ in 0..num_blocks {
             let block_id = self
                 .free_queue
@@ -433,15 +454,20 @@ impl BlockPool {
 
             // Evict from cache if this block was cached
             if self.enable_caching {
-                self.maybe_evict_cached_block(block_id);
+                if let Some(evicted) = self.maybe_evict_cached_block(block_id) {
+                    evicted_blocks.push(evicted);
+                }
             }
 
             debug_assert_eq!(self.blocks[block_id].ref_cnt, 0);
             self.blocks[block_id].ref_cnt = 1;
-            result.push(block_id);
+            block_ids.push(block_id);
         }
 
-        Some(result)
+        Some(BlockAllocation {
+            block_ids,
+            evicted_blocks,
+        })
     }
 
     /// Cache full blocks by assigning hashes and inserting into the hash map.
@@ -497,11 +523,18 @@ impl BlockPool {
     }
 
     /// Evict a cached block's hash from the cache map and reset its hash.
-    fn maybe_evict_cached_block(&mut self, block_id: usize) {
+    fn maybe_evict_cached_block(&mut self, block_id: usize) -> Option<EvictedCacheBlock> {
         let block_hashes = std::mem::take(&mut self.blocks[block_id].block_hashes);
+        if block_hashes.is_empty() {
+            return None;
+        }
         for hash in &block_hashes {
             self.cached_block_hash_to_block.pop(hash, block_id);
         }
+        Some(EvictedCacheBlock {
+            block_id,
+            block_hashes,
+        })
     }
 
     /// Reset the entire prefix cache. Only succeeds if all blocks are free.

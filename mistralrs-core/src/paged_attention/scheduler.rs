@@ -221,6 +221,7 @@ impl PagedAttentionScheduler {
             } else {
                 super::kv_cache_manager::ComputedBlocks {
                     block_ids: Vec::new(),
+                    external_block_hashes: Vec::new(),
                     num_computed_tokens: 0,
                 }
             };
@@ -255,15 +256,27 @@ impl PagedAttentionScheduler {
                 computed.num_computed_tokens = clamped;
             }
 
-            let num_computed = computed.num_computed_tokens;
+            let mut num_computed = computed.num_computed_tokens;
             let computed_block_count = num_computed / self.block_size;
             let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
-            let alloc_result = kv_mgr.allocate_slots(
-                seq_id,
-                num_tokens,
-                &computed.block_ids[..computed_block_count],
-            );
+            computed.block_ids.truncate(computed_block_count);
+            let local_count = computed.block_ids.len();
+            computed
+                .external_block_hashes
+                .truncate(computed_block_count.saturating_sub(local_count));
+            let mut alloc_result =
+                kv_mgr.allocate_slots_for_computed(seq_id, num_tokens, &computed);
             drop(kv_mgr);
+
+            if alloc_result.is_none() && !computed.external_block_hashes.is_empty() {
+                computed.external_block_hashes.clear();
+                computed.num_computed_tokens = computed.block_ids.len() * self.block_size;
+                num_computed = computed.num_computed_tokens;
+
+                let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+                alloc_result = kv_mgr.allocate_slots_for_computed(seq_id, num_tokens, &computed);
+                drop(kv_mgr);
+            }
 
             match alloc_result {
                 Some(_) => {
@@ -286,11 +299,8 @@ impl PagedAttentionScheduler {
 
                             // Retry allocation
                             let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
-                            let retry = kv_mgr.allocate_slots(
-                                seq_id,
-                                num_tokens,
-                                &computed.block_ids[..computed_block_count],
-                            );
+                            let retry =
+                                kv_mgr.allocate_slots_for_computed(seq_id, num_tokens, &computed);
                             drop(kv_mgr);
 
                             if retry.is_none() {
