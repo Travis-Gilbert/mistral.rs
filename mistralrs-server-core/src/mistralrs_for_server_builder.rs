@@ -749,7 +749,7 @@ impl MistralRsForServerBuilder {
             false,
             mapper,
             isq,
-            cache_config,
+            cache_config.clone(),
         )?;
         info!("Model loaded.");
 
@@ -881,13 +881,13 @@ impl MistralRsForServerBuilder {
                 .models
                 .iter()
                 .map(|_| PagedKvModelRequest {
-                    paged_attn: requested_cache_config,
+                    paged_attn: requested_cache_config.clone(),
                     max_num_seqs: self.max_seqs,
                 })
                 .collect::<Vec<_>>(),
             Default::default(),
         )?;
-        let first_cache_config = paged_kv_plan.paged_attn[0];
+        let first_cache_config = paged_kv_plan.paged_attn[0].clone();
 
         let isq = first_model
             .in_situ_quant
@@ -907,7 +907,7 @@ impl MistralRsForServerBuilder {
             false,
             mapper,
             isq,
-            first_cache_config,
+            first_cache_config.clone(),
         )?;
         if let Some(mtp_config) = self.mtp_config.clone() {
             pipeline
@@ -1035,7 +1035,7 @@ impl MistralRsForServerBuilder {
                 false,
                 mapper,
                 isq,
-                paged_kv_plan.paged_attn[model_index],
+                paged_kv_plan.paged_attn[model_index].clone(),
             )?;
 
             // Each model gets its own scheduler
@@ -1320,10 +1320,20 @@ async fn init_scheduler_config(
 ) -> SchedulerConfig {
     if cache_config.is_some() {
         // Handle case where we may have device mapping
-        if let Some(ref cache_config) = pipeline.lock().await.get_metadata().cache_config {
+        if let Some(ref pipeline_cache_config) = pipeline.lock().await.get_metadata().cache_config {
+            if let Some(kv_cache_connector) = cache_config
+                .as_ref()
+                .and_then(PagedAttentionConfig::kv_cache_connector)
+            {
+                return SchedulerConfig::PagedAttentionMetaWithConnector {
+                    max_num_seqs: args_max_seqs,
+                    config: pipeline_cache_config.clone(),
+                    kv_cache_connector,
+                };
+            }
             SchedulerConfig::PagedAttentionMeta {
                 max_num_seqs: args_max_seqs,
-                config: cache_config.clone(),
+                config: pipeline_cache_config.clone(),
             }
         } else {
             SchedulerConfig::DefaultScheduler {

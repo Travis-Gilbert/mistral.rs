@@ -33,16 +33,18 @@ pub use scheduler::{
 };
 
 use crate::MemoryUsage;
+use std::{fmt, sync::Arc};
 use tracing::info;
 
 pub const DEFAULT_PAGED_ATTENTION_BLOCK_SIZE: usize = 32;
 
 /// All memory counts in MB. Default for block size is 32.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct PagedAttentionConfig {
     pub(crate) block_size: Option<usize>,
     pub(crate) mem_gpu: MemoryGpuConfig,
     pub(crate) cache_type: PagedCacheType,
+    pub(crate) kv_cache_connector: Option<Arc<dyn KvCacheConnector>>,
 }
 
 impl PagedAttentionConfig {
@@ -55,7 +57,41 @@ impl PagedAttentionConfig {
             block_size,
             mem_gpu,
             cache_type,
+            kv_cache_connector: None,
         })
+    }
+
+    /// Install an external KV cache connector for paged-attention prefix blocks.
+    pub fn with_kv_cache_connector(mut self, connector: Arc<dyn KvCacheConnector>) -> Self {
+        self.kv_cache_connector = Some(connector);
+        self
+    }
+
+    /// Return the configured external KV cache connector, if any.
+    pub fn kv_cache_connector(&self) -> Option<Arc<dyn KvCacheConnector>> {
+        self.kv_cache_connector.clone()
+    }
+
+    pub(crate) fn with_optional_kv_cache_connector(
+        mut self,
+        connector: Option<Arc<dyn KvCacheConnector>>,
+    ) -> Self {
+        self.kv_cache_connector = connector;
+        self
+    }
+}
+
+impl fmt::Debug for PagedAttentionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PagedAttentionConfig")
+            .field("block_size", &self.block_size)
+            .field("mem_gpu", &self.mem_gpu)
+            .field("cache_type", &self.cache_type)
+            .field(
+                "kv_cache_connector",
+                &self.kv_cache_connector.as_ref().map(|_| "<installed>"),
+            )
+            .finish()
     }
 }
 
