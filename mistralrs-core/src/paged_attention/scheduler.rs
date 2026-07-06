@@ -16,6 +16,7 @@ use crate::{
             clamp_prefix_cache_hit_len, compute_block_hashes, compute_new_block_hashes, BlockHash,
             MultiModalFeature,
         },
+        kv_cache_connector::KvCacheConnector,
         kv_cache_manager::KVCacheManager,
     },
     scheduler::{PagedPrefixCacheValidator, Scheduler, SchedulerOutput},
@@ -65,15 +66,35 @@ pub struct PagedAttentionScheduler {
 
 impl PagedAttentionScheduler {
     pub fn new(config: PagedAttentionSchedulerConfig, cache_config: CacheConfig) -> Self {
+        Self::new_inner(config, cache_config, None)
+    }
+
+    pub fn new_with_kv_cache_connector(
+        config: PagedAttentionSchedulerConfig,
+        cache_config: CacheConfig,
+        kv_cache_connector: Arc<dyn KvCacheConnector>,
+    ) -> Self {
+        Self::new_inner(config, cache_config, Some(kv_cache_connector))
+    }
+
+    fn new_inner(
+        config: PagedAttentionSchedulerConfig,
+        cache_config: CacheConfig,
+        kv_cache_connector: Option<Arc<dyn KvCacheConnector>>,
+    ) -> Self {
+        let mut kv_cache_manager = KVCacheManager::new(
+            cache_config.num_gpu_blocks,
+            cache_config.block_size,
+            true,
+            cache_config.kv_cache_group_ids.clone(),
+        );
+        if let Some(connector) = kv_cache_connector {
+            kv_cache_manager.set_kv_cache_connector(connector);
+        }
         Self {
             waiting: VecDeque::new(),
             running: VecDeque::new(),
-            kv_cache_manager: Arc::new(tokio::sync::Mutex::new(KVCacheManager::new(
-                cache_config.num_gpu_blocks,
-                cache_config.block_size,
-                true,
-                cache_config.kv_cache_group_ids.clone(),
-            ))),
+            kv_cache_manager: Arc::new(tokio::sync::Mutex::new(kv_cache_manager)),
             block_size: cache_config.block_size,
             config,
             prefix_caching_enabled: true,
@@ -636,5 +657,61 @@ impl Scheduler for PagedAttentionScheduler {
     }
     fn set_prefix_caching_enabled(&mut self, enabled: bool) {
         self.set_prefix_caching_enabled_sync(enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paged_attention::{
+        block_hash::compute_block_hashes, kv_cache_connector::KvCacheConnector,
+        PagedAttentionConfig, PagedCacheType,
+    };
+    use crate::MemoryGpuConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountingConnector {
+        lookups: AtomicUsize,
+    }
+
+    impl KvCacheConnector for CountingConnector {
+        fn lookup_blocks(&self, block_hashes: &[BlockHash], _group_ids: &[u32]) -> usize {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            block_hashes.len().min(1)
+        }
+    }
+
+    #[test]
+    fn scheduler_installs_paged_attention_connector() {
+        let connector = Arc::new(CountingConnector::default());
+        let paged_attn_config =
+            PagedAttentionConfig::new(Some(4), MemoryGpuConfig::MbAmount(1), PagedCacheType::Auto)
+                .expect("test config should be valid")
+                .with_kv_cache_connector(connector.clone());
+        let scheduler = PagedAttentionScheduler::new_with_kv_cache_connector(
+            PagedAttentionSchedulerConfig { max_num_seqs: 4 },
+            CacheConfig {
+                block_size: 4,
+                num_gpu_blocks: 16,
+                cache_type: PagedCacheType::Auto,
+                kv_cache_group_ids: vec![0],
+            },
+            paged_attn_config
+                .kv_cache_connector()
+                .expect("connector should be installed"),
+        );
+
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let block_hashes = compute_block_hashes(&tokens, 4, &[], &[]);
+        let kv_cache_manager = scheduler
+            .kv_cache_manager
+            .try_lock()
+            .expect("scheduler test should hold the only lock");
+        let computed = kv_cache_manager.get_computed_blocks(&block_hashes, tokens.len());
+
+        assert_eq!(computed.external_block_hashes.len(), 1);
+        assert_eq!(computed.num_computed_tokens, 4);
+        assert_eq!(connector.lookups.load(Ordering::SeqCst), 1);
     }
 }

@@ -60,10 +60,10 @@ impl AnyModelBuilder {
 
     fn paged_attn_cfg(&self) -> Option<PagedAttentionConfig> {
         match self {
-            AnyModelBuilder::Text(b) => b.paged_attn_cfg,
-            AnyModelBuilder::Multimodal(b) => b.paged_attn_cfg,
-            AnyModelBuilder::Auto(b) => b.paged_attn_cfg,
-            AnyModelBuilder::Gguf(b) => b.paged_attn_cfg,
+            AnyModelBuilder::Text(b) => b.paged_attn_cfg.clone(),
+            AnyModelBuilder::Multimodal(b) => b.paged_attn_cfg.clone(),
+            AnyModelBuilder::Auto(b) => b.paged_attn_cfg.clone(),
+            AnyModelBuilder::Gguf(b) => b.paged_attn_cfg.clone(),
             AnyModelBuilder::Diffusion(_)
             | AnyModelBuilder::Speech(_)
             | AnyModelBuilder::Embedding(_) => None,
@@ -356,13 +356,13 @@ pub(crate) fn default_scheduler_config(max_num_seqs: usize) -> anyhow::Result<Sc
 
 pub(crate) async fn scheduler_config_from_pipeline<P>(
     pipeline: &Arc<Mutex<P>>,
-    paged_attn_requested: bool,
+    paged_attn_config: Option<&PagedAttentionConfig>,
     max_num_seqs: usize,
 ) -> anyhow::Result<SchedulerConfig>
 where
     P: ?Sized + Pipeline,
 {
-    if paged_attn_requested {
+    if paged_attn_config.is_some() {
         if let Some(config) = pipeline
             .lock()
             .await
@@ -371,6 +371,15 @@ where
             .as_ref()
             .cloned()
         {
+            if let Some(kv_cache_connector) =
+                paged_attn_config.and_then(PagedAttentionConfig::kv_cache_connector)
+            {
+                return Ok(SchedulerConfig::PagedAttentionMetaWithConnector {
+                    max_num_seqs,
+                    config,
+                    kv_cache_connector,
+                });
+            }
             return Ok(SchedulerConfig::PagedAttentionMeta {
                 max_num_seqs,
                 config,
@@ -435,7 +444,7 @@ pub(crate) async fn build_pipeline_from_text_loader(
             .unwrap_or(mistralrs_core::DeviceMapSetting::Auto(
                 mistralrs_core::AutoDeviceMapParams::default_text(),
             ));
-    let paged_attn_requested = builder.paged_attn_cfg.is_some();
+    let paged_attn_cfg = builder.paged_attn_cfg.clone();
 
     let pipeline = loader.load_model_from_hf(
         builder.hf_revision,
@@ -445,7 +454,7 @@ pub(crate) async fn build_pipeline_from_text_loader(
         !builder.with_logging,
         device_map_setting,
         isq_type,
-        builder.paged_attn_cfg,
+        paged_attn_cfg.clone(),
     )?;
     if let Some(mtp_config) = builder.mtp_config.clone() {
         pipeline
@@ -455,7 +464,7 @@ pub(crate) async fn build_pipeline_from_text_loader(
     }
 
     let scheduler_config =
-        scheduler_config_from_pipeline(&pipeline, paged_attn_requested, builder.max_num_seqs)
+        scheduler_config_from_pipeline(&pipeline, paged_attn_cfg.as_ref(), builder.max_num_seqs)
             .await?;
 
     let add_model_config = AddModelConfig {
@@ -488,7 +497,7 @@ pub(crate) async fn build_pipeline_from_gguf_loader(
         .device_mapping
         .clone()
         .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()));
-    let paged_attn_requested = builder.paged_attn_cfg.is_some();
+    let paged_attn_cfg = builder.paged_attn_cfg.clone();
 
     let pipeline = loader.load_model_from_hf(
         builder.hf_revision,
@@ -498,11 +507,11 @@ pub(crate) async fn build_pipeline_from_gguf_loader(
         !builder.with_logging,
         device_map_setting,
         None,
-        builder.paged_attn_cfg,
+        paged_attn_cfg.clone(),
     )?;
 
     let scheduler_config =
-        scheduler_config_from_pipeline(&pipeline, paged_attn_requested, builder.max_num_seqs)
+        scheduler_config_from_pipeline(&pipeline, paged_attn_cfg.as_ref(), builder.max_num_seqs)
             .await?;
 
     let add_model_config = AddModelConfig {
@@ -607,7 +616,7 @@ pub async fn build_text_pipeline(
             .clone()
             .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
         isq_type,
-        builder.paged_attn_cfg,
+        builder.paged_attn_cfg.clone(),
     )?;
     if let Some(mtp_config) = builder.mtp_config.clone() {
         pipeline
@@ -618,7 +627,7 @@ pub async fn build_text_pipeline(
 
     let scheduler_config = scheduler_config_from_pipeline(
         &pipeline,
-        builder.paged_attn_cfg.is_some(),
+        builder.paged_attn_cfg.as_ref(),
         builder.max_num_seqs,
     )
     .await?;
@@ -730,7 +739,7 @@ pub async fn build_multimodal_pipeline(
                 AutoDeviceMapParams::default_multimodal(),
             )),
         isq_type,
-        builder.paged_attn_cfg,
+        builder.paged_attn_cfg.clone(),
     )?;
     if let Some(mtp_config) = builder.mtp_config.clone() {
         pipeline
@@ -741,7 +750,7 @@ pub async fn build_multimodal_pipeline(
 
     let scheduler_config = scheduler_config_from_pipeline(
         &pipeline,
-        builder.paged_attn_cfg.is_some(),
+        builder.paged_attn_cfg.as_ref(),
         builder.max_num_seqs,
     )
     .await?;
@@ -847,12 +856,12 @@ pub async fn build_gguf_pipeline(
             .clone()
             .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
         None,
-        builder.paged_attn_cfg,
+        builder.paged_attn_cfg.clone(),
     )?;
 
     let scheduler_config = scheduler_config_from_pipeline(
         &pipeline,
-        builder.paged_attn_cfg.is_some(),
+        builder.paged_attn_cfg.as_ref(),
         builder.max_num_seqs,
     )
     .await?;
@@ -1200,7 +1209,7 @@ pub async fn build_auto_pipeline(
             .clone()
             .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
         isq_type,
-        builder.paged_attn_cfg,
+        builder.paged_attn_cfg.clone(),
     )?;
     if let Some(mtp_config) = builder.mtp_config.clone() {
         pipeline
@@ -1211,7 +1220,7 @@ pub async fn build_auto_pipeline(
 
     let scheduler_config = scheduler_config_from_pipeline(
         &pipeline,
-        builder.paged_attn_cfg.is_some(),
+        builder.paged_attn_cfg.as_ref(),
         builder.max_num_seqs,
     )
     .await?;

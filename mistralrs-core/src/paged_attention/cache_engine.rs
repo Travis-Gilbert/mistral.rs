@@ -7,7 +7,6 @@ use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
 
 use super::config::{KvCacheLayout, ModelConfigLike};
-
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
 pub enum PagedCacheType {

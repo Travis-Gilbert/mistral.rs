@@ -299,8 +299,8 @@ pub use mistralrs_core::{
 
 // ========== Config Types ==========
 pub use mistralrs_core::{
-    DefaultSchedulerMethod, IsqType, MemoryGpuConfig, MistralRsConfig, ModelDType,
-    PagedAttentionConfig, PagedCacheType, SchedulerConfig, WebSearchOptions,
+    DefaultSchedulerMethod, IsqType, KvCacheConnector, MemoryGpuConfig, MistralRsConfig,
+    ModelDType, PagedAttentionConfig, PagedCacheType, SchedulerConfig, WebSearchOptions,
 };
 
 // ========== Audio Types ==========

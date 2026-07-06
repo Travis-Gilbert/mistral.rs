@@ -265,7 +265,8 @@ impl Engine {
 
         let config = if no_kv_cache {
             match config {
-                SchedulerConfig::PagedAttentionMeta { max_num_seqs, .. } => {
+                SchedulerConfig::PagedAttentionMeta { max_num_seqs, .. }
+                | SchedulerConfig::PagedAttentionMetaWithConnector { max_num_seqs, .. } => {
                     SchedulerConfig::DefaultScheduler {
                         method: DefaultSchedulerMethod::Fixed(max_num_seqs.try_into().unwrap()),
                     }

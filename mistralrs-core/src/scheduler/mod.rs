@@ -8,8 +8,8 @@ use tokio::sync::Mutex;
 use crate::{
     engine::IntervalLogger,
     paged_attention::{
-        block_hash::BlockHash, CacheConfig, KVCacheManager, PagedAttentionScheduler,
-        PagedAttentionSchedulerConfig, PagedAttentionSchedulerOutput,
+        block_hash::BlockHash, CacheConfig, KVCacheManager, KvCacheConnector,
+        PagedAttentionScheduler, PagedAttentionSchedulerConfig, PagedAttentionSchedulerOutput,
     },
     sequence::Sequence,
 };
@@ -22,6 +22,11 @@ pub enum SchedulerConfig {
     PagedAttentionMeta {
         max_num_seqs: usize,
         config: CacheConfig,
+    },
+    PagedAttentionMetaWithConnector {
+        max_num_seqs: usize,
+        config: CacheConfig,
+        kv_cache_connector: Arc<dyn KvCacheConnector>,
     },
 }
 
@@ -38,6 +43,17 @@ impl SchedulerConfig {
                 PagedAttentionSchedulerConfig { max_num_seqs },
                 config,
             ))),
+            Self::PagedAttentionMetaWithConnector {
+                max_num_seqs,
+                config,
+                kv_cache_connector,
+            } => Arc::new(Mutex::new(
+                PagedAttentionScheduler::new_with_kv_cache_connector(
+                    PagedAttentionSchedulerConfig { max_num_seqs },
+                    config,
+                    kv_cache_connector,
+                ),
+            )),
         }
     }
 }

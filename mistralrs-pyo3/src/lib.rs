@@ -887,6 +887,8 @@ impl Runner {
             (_, _, _, _, _, _) => None,
         };
 
+        let paged_attention_requested = cache_config.is_some();
+
         let pipeline = loader
             .load_model_from_hf(
                 None,
@@ -910,7 +912,7 @@ impl Runner {
                 .map_err(|e| PyApiErr::from(&e))?;
         }
 
-        let scheduler_config = if cache_config.is_some() {
+        let scheduler_config = if paged_attention_requested {
             // Handle case where we may have device mapping
             if let Some(ref cache_config) = pipeline.blocking_lock().get_metadata().cache_config {
                 SchedulerConfig::PagedAttentionMeta {
